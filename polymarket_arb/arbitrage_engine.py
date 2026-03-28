@@ -13,6 +13,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import time
 from collections.abc import Iterable
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -23,27 +24,57 @@ import httpx
 
 from polymarket_arb.config import Settings
 from polymarket_arb.orderbook import OrderBookState
-from polymarket_arb.shadow_executor import ShadowExecutor
+from polymarket_arb.shadow_executor import ShadowExecutor, micro_sharp_armed
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class AutoResearchConfig:
+    """Loose gate + verbose scan (debug); Up/Down markets use same code paths as Yes/No."""
+
     PACKAGE_COST_USD: Decimal = Decimal("8.00")
-    MAX_COMBINED_ASK: Decimal = Decimal("0.990")
-    MIN_GROSS_EDGE: Decimal = Decimal("0.008")
-    MAX_SIDE_SPREAD: Decimal = Decimal("0.03")
-    MIN_SIDE_DEPTH: Decimal = Decimal("20.00")
-    MIN_TOP_ASK_SIZE: Decimal = Decimal("8.00")
-    ENTRY_START_SEC: int = 120
-    ENTRY_CUTOFF_SEC: int = 60
-    COOLDOWN_MS: int = 4000
-    PAPER_PROBE_MS: int = 1500
-    PAPER_SECOND_LEG_PROBE_MS: int = 900
+    MAX_COMBINED_ASK: Decimal = Decimal("0.999")
+    MIN_GROSS_EDGE: Decimal = Decimal("-0.1")
+    MAX_SIDE_SPREAD: Decimal = Decimal("0.05")
+    MIN_SIDE_DEPTH: Decimal = Decimal("0.1")
+    MIN_TOP_ASK_SIZE: Decimal = Decimal("0.1")
+    TRIGGER_ON_ASK_SUM_ONLY: bool = True
+    ENTRY_CUTOFF_SEC: int = 0
+    ENTRY_START_SEC: int = 10**12
+    SCANNER_FP_DEDUP: bool = False
+    COOLDOWN_MS: int = 0
+    ARMED_LOG_MIN_INTERVAL_SEC: float = 0.0
+    SHADOW_DISPATCH_MIN_INTERVAL_SEC: float = 0.0
+    PAPER_PROBE_MS: int = 0
+    PAPER_SECOND_LEG_PROBE_MS: int = 0
+    SCAN_VERBOSE_ALL: bool = True
+    SCAN_BYPASS_BOOK_FILTERS: bool = True
+    # Throttle noisy [SCAN] lines (parity band 0.999–1.001 logs more often, in yellow).
+    SCAN_SNIPER_INTERVAL_SEC: float = 1.0
+    SCAN_SNIPER_PARITY_INTERVAL_SEC: float = 0.25
 
 
 AUTORESEARCH_CONFIG = AutoResearchConfig()
+
+_SCAN_YELLOW = "\033[93;1m"
+_SCAN_RESET = "\033[0m"
+
+
+def _scan_line_color_wrap(gross: Decimal) -> tuple[str, str]:
+    if Decimal("0.999") <= gross <= Decimal("1.001"):
+        return _SCAN_YELLOW, _SCAN_RESET
+    return "", ""
+
+
+def _known_size_below_minimum(size: Decimal, minimum: Decimal) -> bool:
+    """
+    WebSocket ``price_change`` rows often omit sizes (stored as 0).
+
+    Only enforce depth/liquidity floors when we have a positive reported size.
+    """
+
+    return size > 0 and size < minimum
 
 
 def _parse_json_list_field(value: Any) -> Any:
@@ -153,12 +184,61 @@ def calculate_taker_fee_usdc(
     return raw.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
 
 
+def _try_parse_yes_no_pair_from_gamma_market(
+    m: dict[str, Any],
+    event: dict[str, Any] | None,
+) -> YesNoMarket | None:
+    """
+    Parse one Gamma market row into a binary CLOB pair.
+
+    Accepts Yes/No (binary) and Up/Down (BTC 5m) outcome labels.
+    """
+
+    if not m.get("enableOrderBook", False):
+        return None
+    raw_ids = m.get("clobTokenIds")
+    if isinstance(raw_ids, str):
+        ids = [str(x) for x in json.loads(raw_ids)]
+    elif isinstance(raw_ids, list):
+        ids = [str(x) for x in raw_ids]
+    else:
+        return None
+    outcomes = _parse_json_list_field(m.get("outcomes")) or []
+    if not isinstance(outcomes, list) or len(ids) != len(outcomes):
+        return None
+    idx_yes: int | None = None
+    idx_no: int | None = None
+    for i, o in enumerate(outcomes):
+        label = str(o).strip().lower()
+        if label in ("yes", "up"):
+            idx_yes = i
+        elif label in ("no", "down"):
+            idx_no = i
+    if idx_yes is None or idx_no is None or idx_yes == idx_no:
+        return None
+    cond = str(m.get("conditionId") or m.get("id") or "")
+    title = str(m.get("groupItemTitle") or m.get("question") or cond or "market")
+    ev = event or {}
+    end_date_time = _parse_gamma_datetime(
+        m.get("endDate") or m.get("resolveDate") or ev.get("endDate") or ev.get("resolveDate"),
+    )
+    if end_date_time is None:
+        return None
+    return YesNoMarket(
+        condition_id=cond or f"{title}:{idx_yes}:{idx_no}",
+        yes_token_id=ids[idx_yes],
+        no_token_id=ids[idx_no],
+        label=title,
+        end_date_time=end_date_time,
+    )
+
+
 async def fetch_yes_no_markets(
     client: httpx.AsyncClient,
     settings: Settings,
     event_slug: str,
 ) -> list[YesNoMarket]:
-    """Resolve a Gamma *event* slug into Yes/No token pairs (one row per strike/market)."""
+    """Resolve a Gamma *event* slug into Yes/No (or Up/Down) token pairs (one row per market)."""
 
     headers = {"User-Agent": settings.http_user_agent}
     url = f"{settings.gamma_api_base_url}/events"
@@ -168,52 +248,60 @@ async def fetch_yes_no_markets(
     if not isinstance(events, list) or not events:
         raise ValueError(f"No Gamma event for slug={event_slug!r}")
     event = events[0]
+    if not isinstance(event, dict):
+        raise ValueError(f"No Gamma event for slug={event_slug!r}")
     markets_raw = event.get("markets") or []
     if not isinstance(markets_raw, list):
         return []
     pairs: list[YesNoMarket] = []
     for m in markets_raw:
-        if not m.get("enableOrderBook", False):
+        if not isinstance(m, dict):
             continue
-        raw_ids = m.get("clobTokenIds")
-        if isinstance(raw_ids, str):
-            ids = [str(x) for x in json.loads(raw_ids)]
-        elif isinstance(raw_ids, list):
-            ids = [str(x) for x in raw_ids]
-        else:
-            continue
-        outcomes = _parse_json_list_field(m.get("outcomes")) or []
-        if not isinstance(outcomes, list) or len(ids) != len(outcomes):
-            continue
-        idx_yes: int | None = None
-        idx_no: int | None = None
-        for i, o in enumerate(outcomes):
-            label = str(o).strip().lower()
-            if label == "yes":
-                idx_yes = i
-            elif label == "no":
-                idx_no = i
-        if idx_yes is None or idx_no is None or idx_yes == idx_no:
-            continue
-        cond = str(m.get("conditionId") or m.get("id") or "")
-        title = str(m.get("groupItemTitle") or m.get("question") or cond or "market")
-        end_date_time = _parse_gamma_datetime(
-            m.get("endDate") or m.get("resolveDate") or event.get("endDate") or event.get("resolveDate"),
-        )
-        if end_date_time is None:
-            continue
-        pairs.append(
-            YesNoMarket(
-                condition_id=cond or f"{title}:{idx_yes}:{idx_no}",
-                yes_token_id=ids[idx_yes],
-                no_token_id=ids[idx_no],
-                label=title,
-                end_date_time=end_date_time,
-            )
-        )
+        p = _try_parse_yes_no_pair_from_gamma_market(m, event)
+        if p is not None:
+            pairs.append(p)
     if not pairs:
         raise ValueError(f"No Yes/No CLOB pairs parsed for event slug={event_slug!r}")
     return pairs
+
+
+async def fetch_yes_no_markets_by_market_slug(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    market_slug: str,
+) -> list[YesNoMarket]:
+    """Use Gamma ``GET /markets?slug=`` (required for *market* slugs like ``btc-updown-5m-*``)."""
+
+    headers = {"User-Agent": settings.http_user_agent}
+    url = f"{settings.gamma_api_base_url}/markets"
+    resp = await client.get(url, params={"slug": market_slug}, headers=headers)
+    resp.raise_for_status()
+    rows = resp.json()
+    if not isinstance(rows, list):
+        raise ValueError(f"Unexpected Gamma /markets payload for slug={market_slug!r}")
+    pairs: list[YesNoMarket] = []
+    for m in rows:
+        if not isinstance(m, dict):
+            continue
+        p = _try_parse_yes_no_pair_from_gamma_market(m, None)
+        if p is not None:
+            pairs.append(p)
+    if not pairs:
+        raise ValueError(f"No Up/Down or Yes/No CLOB pair for market slug={market_slug!r}")
+    return pairs
+
+
+async def fetch_yes_no_markets_any(
+    client: httpx.AsyncClient,
+    settings: Settings,
+    slug: str,
+) -> list[YesNoMarket]:
+    """Try Gamma event slug resolution, then single-market slug (BTC 5m)."""
+
+    try:
+        return await fetch_yes_no_markets(client, settings, slug)
+    except (ValueError, httpx.HTTPError):
+        return await fetch_yes_no_markets_by_market_slug(client, settings, slug)
 
 
 class ArbitrageScanner:
@@ -250,9 +338,18 @@ class ArbitrageScanner:
         self._fees: dict[str, TokenFeeParams] = {}
         self._stop = asyncio.Event()
         self._last_alert_fp: dict[str, tuple[Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]] = {}
+        self._last_armed_log_mono: dict[str, float] = {}
+        self._last_shadow_dispatch_mono: dict[str, float] = {}
+        self._scan_sniper_last_mono: dict[str, float] = {}
 
     def stop(self) -> None:
         self._stop.set()
+
+    @property
+    def tracked_market_count(self) -> int:
+        """Approximate number of Yes/No pairs being scanned (for logging)."""
+
+        return len(self._markets)
 
     def _fee_url(self, token_id: str) -> str:
         from urllib.parse import quote
@@ -384,50 +481,113 @@ class ArbitrageScanner:
                 qy = self._order_book.get_quote(market.yes_token_id)
                 qn = self._order_book.get_quote(market.no_token_id)
                 if qy is None or qn is None:
+                    logger.debug(
+                        "scan wait book %s up=%s down=%s",
+                        market.label,
+                        qy is not None,
+                        qn is not None,
+                    )
                     continue
-                now_utc = dt.datetime.now(tz=dt.timezone.utc)
-                seconds_to_expiry = (market.end_date_time - now_utc).total_seconds()
-                if seconds_to_expiry < float(cfg.ENTRY_CUTOFF_SEC):
-                    continue
-                if seconds_to_expiry > float(cfg.ENTRY_START_SEC):
-                    continue
-                if qy.spread > cfg.MAX_SIDE_SPREAD or qn.spread > cfg.MAX_SIDE_SPREAD:
-                    continue
-                if qy.best_ask_size < cfg.MIN_TOP_ASK_SIZE or qn.best_ask_size < cfg.MIN_TOP_ASK_SIZE:
-                    continue
-                if qy.best_bid_size < cfg.MIN_SIDE_DEPTH or qn.best_bid_size < cfg.MIN_SIDE_DEPTH:
-                    continue
+                if not cfg.SCAN_BYPASS_BOOK_FILTERS:
+                    now_utc = dt.datetime.now(tz=dt.timezone.utc)
+                    seconds_to_expiry = (market.end_date_time - now_utc).total_seconds()
+                    if seconds_to_expiry < float(cfg.ENTRY_CUTOFF_SEC):
+                        continue
+                    if seconds_to_expiry > float(cfg.ENTRY_START_SEC):
+                        continue
+                    if qy.spread > cfg.MAX_SIDE_SPREAD or qn.spread > cfg.MAX_SIDE_SPREAD:
+                        continue
+                    if _known_size_below_minimum(
+                        qy.best_ask_size,
+                        cfg.MIN_TOP_ASK_SIZE,
+                    ) or _known_size_below_minimum(qn.best_ask_size, cfg.MIN_TOP_ASK_SIZE):
+                        continue
+                    if _known_size_below_minimum(
+                        qy.best_bid_size,
+                        cfg.MIN_SIDE_DEPTH,
+                    ) or _known_size_below_minimum(qn.best_bid_size, cfg.MIN_SIDE_DEPTH):
+                        continue
                 ask_yes = qy.best_ask
                 ask_no = qn.best_ask
                 if ask_yes <= 0 or ask_no <= 0:
+                    logger.debug(
+                        "scan skip non-positive ask %s up=%s down=%s",
+                        market.label,
+                        ask_yes,
+                        ask_no,
+                    )
                     continue
-                fy = await self._fee_for(market.yes_token_id)
-                fn = await self._fee_for(market.no_token_id)
-                fee_yes = calculate_taker_fee_usdc(unit, ask_yes, fy)
-                fee_no = calculate_taker_fee_usdc(unit, ask_no, fn)
-                total = ask_yes + ask_no + fee_yes + fee_no
-                net = Decimal(1) - total
-                if total <= cfg.MAX_COMBINED_ASK and net >= cfg.MIN_GROSS_EDGE:
-                    fp = (ask_yes, ask_no, fee_yes, fee_no, total, net)
-                    if self._last_alert_fp.get(market.condition_id) == fp:
-                        continue
-                    self._last_alert_fp[market.condition_id] = fp
-                    # Silent trawler: no arb banner on stdout; ShadowExecutor prints ghost outcomes only.
-                    if self._shadow is not None:
-                        mid = market.condition_id
-                        asyncio.create_task(
-                            self._shadow.attempt_ghost_trade(
-                                market_id=mid,
-                                yes_token_id=market.yes_token_id,
-                                no_token_id=market.no_token_id,
-                                yes_target_price=ask_yes,
-                                no_target_price=ask_no,
-                                paper_probe_ms=cfg.PAPER_PROBE_MS,
-                                paper_second_leg_probe_ms=cfg.PAPER_SECOND_LEG_PROBE_MS,
-                                package_cost_usd=cfg.PACKAGE_COST_USD,
-                                max_combined_ask=cfg.MAX_COMBINED_ASK,
-                            ),
-                            name=f"shadow_pkg_{mid[:12]}",
+                gross = ask_yes + ask_no
+                edge_gross = Decimal(1) - gross
+                if cfg.TRIGGER_ON_ASK_SUM_ONLY:
+                    fee_yes = Decimal(0)
+                    fee_no = Decimal(0)
+                    total_gate = gross
+                    net = edge_gross
+                    combined_for_log = gross
+                else:
+                    fy = await self._fee_for(market.yes_token_id)
+                    fn = await self._fee_for(market.no_token_id)
+                    fee_yes = calculate_taker_fee_usdc(unit, ask_yes, fy)
+                    fee_no = calculate_taker_fee_usdc(unit, ask_no, fn)
+                    total_gate = ask_yes + ask_no + fee_yes + fee_no
+                    net = Decimal(1) - total_gate
+                    combined_for_log = total_gate
+                gate_ok = total_gate <= cfg.MAX_COMBINED_ASK and net >= cfg.MIN_GROSS_EDGE
+                if cfg.SCAN_VERBOSE_ALL:
+                    now_log = time.monotonic()
+                    lk = market.condition_id
+                    parity_band = Decimal("0.999") <= gross <= Decimal("1.001")
+                    min_gap = (
+                        float(cfg.SCAN_SNIPER_PARITY_INTERVAL_SEC)
+                        if parity_band
+                        else float(cfg.SCAN_SNIPER_INTERVAL_SEC)
+                    )
+                    if now_log - self._scan_sniper_last_mono.get(lk, 0.0) >= min_gap:
+                        self._scan_sniper_last_mono[lk] = now_log
+                        sty, rst = _scan_line_color_wrap(gross)
+                        print(
+                            f"{sty}[SCAN] {market.label} | combined={gross} edge={edge_gross} "
+                            f"| total_gate={total_gate} net={net} | shadow_gate_ok={gate_ok}{rst}",
+                            flush=True,
                         )
-                        await asyncio.sleep(cfg.COOLDOWN_MS / 1000.0)
+                if not gate_ok:
+                    continue
+                mid = market.condition_id
+                mname = market.label if (market.label or "").strip() else mid
+                now_m = time.monotonic()
+                if not cfg.SCAN_VERBOSE_ALL:
+                    armed_iv = float(cfg.ARMED_LOG_MIN_INTERVAL_SEC)
+                    if armed_iv <= 0.0 or now_m - self._last_armed_log_mono.get(mid, 0.0) >= armed_iv:
+                        self._last_armed_log_mono[mid] = now_m
+                        micro_sharp_armed(mname, gross, edge_gross)
+                fp = (ask_yes, ask_no, fee_yes, fee_no, total_gate, net)
+                if cfg.SCANNER_FP_DEDUP:
+                    if self._last_alert_fp.get(mid) == fp:
+                        continue
+                    self._last_alert_fp[mid] = fp
+                if self._shadow is not None:
+                    disp_iv = float(cfg.SHADOW_DISPATCH_MIN_INTERVAL_SEC)
+                    if disp_iv > 0.0 and now_m - self._last_shadow_dispatch_mono.get(mid, 0.0) < disp_iv:
+                        continue
+                    self._last_shadow_dispatch_mono[mid] = now_m
+                    asyncio.create_task(
+                        self._shadow.attempt_ghost_trade(
+                            market_id=mid,
+                            market_name=market.label,
+                            combined_all_in=combined_for_log,
+                            yes_token_id=market.yes_token_id,
+                            no_token_id=market.no_token_id,
+                            yes_target_price=ask_yes,
+                            no_target_price=ask_no,
+                            paper_probe_ms=cfg.PAPER_PROBE_MS,
+                            paper_second_leg_probe_ms=cfg.PAPER_SECOND_LEG_PROBE_MS,
+                            package_cost_usd=cfg.PACKAGE_COST_USD,
+                            max_combined_ask=cfg.MAX_COMBINED_ASK,
+                        ),
+                        name=f"shadow_pkg_{mid[:12]}",
+                    )
+                    cd = max(float(cfg.COOLDOWN_MS), 0.0) / 1000.0
+                    if cd > 0.0:
+                        await asyncio.sleep(cd)
             await asyncio.sleep(self.scan_interval_seconds)

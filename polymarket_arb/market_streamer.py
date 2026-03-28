@@ -426,10 +426,11 @@ class MarketStreamer:
                     if self._stop.is_set():
                         await ws.close()
                         return
+                    raw_txt = message.decode() if isinstance(message, bytes) else str(message)
                     try:
-                        payload = json.loads(message)
+                        payload = json.loads(raw_txt)
                     except json.JSONDecodeError:
-                        logger.debug("Non-JSON WS message: %s", message[:200])
+                        logger.debug("Non-JSON WS message: %s", raw_txt[:200])
                         continue
                     if isinstance(payload, list):
                         for item in payload:
